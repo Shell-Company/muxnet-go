@@ -31,6 +31,7 @@ type Muxnet struct {
 	daemonMode            bool
 	logger                *log.Logger
 	mu                    sync.Mutex
+	watchedSessions       map[string]bool
 }
 
 func NewMuxnet(sessionName string, responseDelay time.Duration, daemonMode bool) *Muxnet {
@@ -44,6 +45,7 @@ func NewMuxnet(sessionName string, responseDelay time.Duration, daemonMode bool)
 		sessionStatus:         make(map[string]string),
 		daemonMode:            daemonMode,
 		logger:                logger,
+		watchedSessions:       make(map[string]bool),
 	}
 
 	if !daemonMode {
@@ -119,6 +121,12 @@ func (m *Muxnet) listTmuxSessions() ([]string, error) {
 }
 
 func (m *Muxnet) monitorSession(sessionName string, newStatus map[string]string) {
+	// Add eye emoji to session label
+	m.setSessionLabel(sessionName, "👁️ "+sessionName)
+
+	// Mark this session as watched
+	m.watchedSessions[sessionName] = true
+
 	content, err := m.capturePane(sessionName)
 	if err != nil {
 		m.logger.Printf("Error capturing pane for session %s: %v", sessionName, err)
@@ -157,6 +165,14 @@ func (m *Muxnet) monitorSession(sessionName string, newStatus map[string]string)
 		m.processedPrompts[sessionName][prompt] = currentTime
 	} else {
 		newStatus[sessionName] = fmt.Sprintf("[Skipped] %s", prompt)
+	}
+}
+
+func (m *Muxnet) setSessionLabel(sessionName, label string) {
+	cmd := exec.Command("tmux", "set-option", "-t", sessionName, "status-left", label)
+	err := cmd.Run()
+	if err != nil {
+		m.logger.Printf("Error setting label for session %s: %v", sessionName, err)
 	}
 }
 
@@ -274,6 +290,12 @@ func (m *Muxnet) deleteSessionFile(sessionName string) {
 	}
 }
 
+func (m *Muxnet) cleanup() {
+	for sessionName := range m.watchedSessions {
+		m.setSessionLabel(sessionName, "")
+	}
+}
+
 func generateSessionName() string {
 	hash := md5.Sum([]byte(time.Now().String()))
 	return hex.EncodeToString(hash[:])
@@ -303,6 +325,7 @@ func main() {
 			muxnet.logger.Println("Ignoring SIGHUP in daemon mode")
 		} else {
 			muxnet.logger.Println("Shutting down...")
+			muxnet.cleanup()
 			if !muxnet.daemonMode {
 				muxnet.app.Stop()
 			}
