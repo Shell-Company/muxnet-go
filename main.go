@@ -9,8 +9,11 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"regexp"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rivo/tview"
@@ -25,43 +28,74 @@ type Muxnet struct {
 	sessionStatus         map[string]string
 	app                   *tview.Application
 	statusView            *tview.TextView
+	daemonMode            bool
+	logger                *log.Logger
+	mu                    sync.Mutex
 }
 
-func NewMuxnet(sessionName string, responseDelay time.Duration) *Muxnet {
-	return &Muxnet{
+func NewMuxnet(sessionName string, responseDelay time.Duration, daemonMode bool) *Muxnet {
+	logger := log.New(os.Stdout, "MuxNet: ", log.Ldate|log.Ltime|log.Lshortfile)
+	m := &Muxnet{
 		sessionName:           sessionName,
 		responseDelay:         responseDelay,
 		promptPattern:         regexp.MustCompile(`.*#([$@%!])\s*(.+?)\s*\.`),
 		processedPrompts:      make(map[string]map[string]time.Time),
 		deduplicationInterval: 60 * time.Second,
 		sessionStatus:         make(map[string]string),
-		app:                   tview.NewApplication(),
-		statusView:            tview.NewTextView().SetDynamicColors(true),
+		daemonMode:            daemonMode,
+		logger:                logger,
 	}
+
+	if !daemonMode {
+		m.app = tview.NewApplication()
+		m.statusView = tview.NewTextView().SetDynamicColors(true)
+	}
+
+	return m
 }
 
 func (m *Muxnet) updateDisplay() {
-	m.statusView.Clear()
-	fmt.Fprintf(m.statusView, "[yellow]MuxNet Status\n\n")
-	fmt.Fprintf(m.statusView, "[green]Active Sessions:\n")
-	for sessionName, lastPrompt := range m.sessionStatus {
-		fmt.Fprintf(m.statusView, "[white]%s: %s\n", sessionName, lastPrompt)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.daemonMode {
+		if len(m.sessionStatus) > 0 {
+			for sessionName, lastPrompt := range m.sessionStatus {
+				m.logger.Printf("Session: %s, Last Prompt: %s\n", sessionName, lastPrompt)
+			}
+		}
+	} else {
+		m.statusView.Clear()
+		fmt.Fprintf(m.statusView, "[yellow]MuxNet Status\n\n")
+		if len(m.sessionStatus) > 0 {
+			fmt.Fprintf(m.statusView, "[green]Active Sessions:\n")
+			for sessionName, lastPrompt := range m.sessionStatus {
+				fmt.Fprintf(m.statusView, "[white]%s: %s\n", sessionName, lastPrompt)
+			}
+		} else {
+			fmt.Fprintf(m.statusView, "[yellow]No active tmux sessions found. Waiting for sessions...\n")
+		}
+		m.app.Draw()
 	}
-	m.app.Draw()
 }
 
 func (m *Muxnet) scanSessions() {
 	for {
 		sessions, err := m.listTmuxSessions()
 		if err != nil {
-			log.Printf("Error listing tmux sessions: %v", err)
-			m.sessionStatus["Error"] = "Failed to list tmux sessions"
-		} else if len(sessions) == 0 {
-			m.sessionStatus["No active sessions"] = ""
-		} else {
-			for _, session := range sessions {
-				m.monitorSession(session)
+			// Only log the error in daemon mode
+			if m.daemonMode {
+				m.logger.Printf("Error listing tmux sessions: %v", err)
 			}
+			m.sessionStatus = make(map[string]string) // Clear existing status
+		} else if len(sessions) == 0 {
+			m.sessionStatus = make(map[string]string) // Clear existing status
+		} else {
+			newStatus := make(map[string]string)
+			for _, session := range sessions {
+				m.monitorSession(session, newStatus)
+			}
+			m.sessionStatus = newStatus
 		}
 
 		m.updateDisplay()
@@ -73,15 +107,21 @@ func (m *Muxnet) listTmuxSessions() ([]string, error) {
 	cmd := exec.Command("tmux", "list-sessions", "-F", "#{session_name}")
 	output, err := cmd.Output()
 	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			// tmux returns exit status 1 when there are no sessions
+			if exitError.ExitCode() == 1 {
+				return []string{}, nil
+			}
+		}
 		return nil, err
 	}
 	return strings.Split(strings.TrimSpace(string(output)), "\n"), nil
 }
 
-func (m *Muxnet) monitorSession(sessionName string) {
+func (m *Muxnet) monitorSession(sessionName string, newStatus map[string]string) {
 	content, err := m.capturePane(sessionName)
 	if err != nil {
-		log.Printf("Error capturing pane for session %s: %v", sessionName, err)
+		m.logger.Printf("Error capturing pane for session %s: %v", sessionName, err)
 		return
 	}
 
@@ -100,9 +140,9 @@ func (m *Muxnet) monitorSession(sessionName string) {
 
 	if glyph == "!" {
 		m.deleteSessionFile(sessionName)
-		m.sessionStatus[sessionName] = "Session file deleted"
+		newStatus[sessionName] = "Session file deleted"
 	} else if m.canExecutePrompt(sessionName, prompt, currentTime) {
-		m.sessionStatus[sessionName] = prompt
+		newStatus[sessionName] = prompt
 		useRAG := glyph == "@"
 		useScreenContent := glyph == "%"
 		if useScreenContent {
@@ -116,7 +156,7 @@ func (m *Muxnet) monitorSession(sessionName string) {
 		}
 		m.processedPrompts[sessionName][prompt] = currentTime
 	} else {
-		m.sessionStatus[sessionName] = fmt.Sprintf("[Skipped] %s", prompt)
+		newStatus[sessionName] = fmt.Sprintf("[Skipped] %s", prompt)
 	}
 }
 
@@ -184,7 +224,7 @@ func (m *Muxnet) takeOver(sessionName, prompt string, useRAG bool, screenContent
 
 	response, err := exec.Command(cmd[0], cmd[1:]...).Output()
 	if err != nil {
-		log.Printf("Error executing Ophanim command: %v", err)
+		m.logger.Printf("Error executing Ophanim command: %v", err)
 		m.sendResponseToPane(sessionName, fmt.Sprintf("Error executing Ophanim command: %v", err))
 	} else {
 		filteredResponse := m.filterCommandResponse(string(response))
@@ -242,6 +282,7 @@ func generateSessionName() string {
 func main() {
 	sessionFlag := flag.String("session", "", "Specify a custom session name")
 	delayFlag := flag.Float64("delay", 2, "Specify the response delay in seconds")
+	daemonFlag := flag.Bool("d", false, "Run in daemon mode")
 	flag.Parse()
 
 	sessionName := *sessionFlag
@@ -249,12 +290,35 @@ func main() {
 		sessionName = generateSessionName()
 	}
 
-	muxnet := NewMuxnet(sessionName, time.Duration(*delayFlag)*time.Second)
+	muxnet := NewMuxnet(sessionName, time.Duration(*delayFlag)*time.Second, *daemonFlag)
 
-	muxnet.app.SetRoot(muxnet.statusView, true)
-	go muxnet.scanSessions()
+	// Set up signal handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
 
-	if err := muxnet.app.Run(); err != nil {
-		log.Fatalf("Error running application: %v", err)
+	go func() {
+		sig := <-sigChan
+		muxnet.logger.Printf("Received signal: %v", sig)
+		if sig == syscall.SIGHUP && muxnet.daemonMode {
+			muxnet.logger.Println("Ignoring SIGHUP in daemon mode")
+		} else {
+			muxnet.logger.Println("Shutting down...")
+			if !muxnet.daemonMode {
+				muxnet.app.Stop()
+			}
+			os.Exit(0)
+		}
+	}()
+
+	if muxnet.daemonMode {
+		muxnet.logger.Println("Starting MuxNet in daemon mode")
+		muxnet.scanSessions()
+	} else {
+		muxnet.app.SetRoot(muxnet.statusView, true)
+		go muxnet.scanSessions()
+
+		if err := muxnet.app.Run(); err != nil {
+			muxnet.logger.Fatalf("Error running application: %v", err)
+		}
 	}
 }
