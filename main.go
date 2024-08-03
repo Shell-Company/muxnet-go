@@ -16,6 +16,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Jeffail/gabs/v2"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/rivo/tview"
 )
 
@@ -32,6 +35,17 @@ type Muxnet struct {
 	logger                *log.Logger
 	mu                    sync.Mutex
 	watchedSessions       map[string]bool
+	ophanim               *OphanimClient
+}
+
+type OphanimClient struct {
+	SessionHash     string
+	ModelConnection *websocket.Conn
+	SessionHistory  *gabs.Container
+	RAGMode         bool
+	RAGQuery        string
+	RAGSource       string
+	SaveDir         string
 }
 
 func NewMuxnet(sessionName string, responseDelay time.Duration, daemonMode bool) *Muxnet {
@@ -46,6 +60,7 @@ func NewMuxnet(sessionName string, responseDelay time.Duration, daemonMode bool)
 		daemonMode:            daemonMode,
 		logger:                logger,
 		watchedSessions:       make(map[string]bool),
+		ophanim:               NewOphanimClient(),
 	}
 
 	if !daemonMode {
@@ -54,6 +69,17 @@ func NewMuxnet(sessionName string, responseDelay time.Duration, daemonMode bool)
 	}
 
 	return m
+}
+
+func NewOphanimClient() *OphanimClient {
+	return &OphanimClient{
+		SessionHash:    uuid.New().String()[:11],
+		SessionHistory: gabs.New(),
+		RAGMode:        false,
+		RAGQuery:       "Current Events",
+		RAGSource:      "Google",
+		SaveDir:        fmt.Sprintf("%s/.config/ophanim/", os.Getenv("HOME")),
+	}
 }
 
 func (m *Muxnet) updateDisplay() {
@@ -85,13 +111,12 @@ func (m *Muxnet) scanSessions() {
 	for {
 		sessions, err := m.listTmuxSessions()
 		if err != nil {
-			// Only log the error in daemon mode
 			if m.daemonMode {
 				m.logger.Printf("Error listing tmux sessions: %v", err)
 			}
-			m.sessionStatus = make(map[string]string) // Clear existing status
+			m.sessionStatus = make(map[string]string)
 		} else if len(sessions) == 0 {
-			m.sessionStatus = make(map[string]string) // Clear existing status
+			m.sessionStatus = make(map[string]string)
 		} else {
 			newStatus := make(map[string]string)
 			for _, session := range sessions {
@@ -110,7 +135,6 @@ func (m *Muxnet) listTmuxSessions() ([]string, error) {
 	output, err := cmd.Output()
 	if err != nil {
 		if exitError, ok := err.(*exec.ExitError); ok {
-			// tmux returns exit status 1 when there are no sessions
 			if exitError.ExitCode() == 1 {
 				return []string{}, nil
 			}
@@ -121,10 +145,7 @@ func (m *Muxnet) listTmuxSessions() ([]string, error) {
 }
 
 func (m *Muxnet) monitorSession(sessionName string, newStatus map[string]string) {
-	// Add eye emoji to session label
 	m.setSessionLabel(sessionName, "👁️ "+sessionName)
-
-	// Mark this session as watched
 	m.watchedSessions[sessionName] = true
 
 	content, err := m.capturePane(sessionName)
@@ -147,7 +168,7 @@ func (m *Muxnet) monitorSession(sessionName string, newStatus map[string]string)
 	currentTime := time.Now()
 
 	if glyph == "!" {
-		m.deleteSessionFile(sessionName)
+		m.ophanim.DeleteSessionFile(m.sessionName)
 		newStatus[sessionName] = "Session file deleted"
 	} else if m.canExecutePrompt(sessionName, prompt, currentTime) {
 		newStatus[sessionName] = prompt
@@ -233,20 +254,13 @@ func (m *Muxnet) takeOver(sessionName, prompt string, useRAG bool, screenContent
 	systemPrompt := "System Prompt: Provide the system commands necessary to achieve the user's goal stated below. Assume the user is on linux and provide ONLY the commands.\n NO explanations.\nNo sudo\n."
 	fullPrompt = fmt.Sprintf("%s%s\n\n'''bash\n", systemPrompt, fullPrompt)
 
-	cmd := []string{"oph", "-prompt", fullPrompt, "-autoload", "-autosave", "-savefile", fmt.Sprintf("muxnet_%s", m.sessionName)}
-	if useRAG {
-		cmd = append(cmd, "-rag", "-rag_source", "Google", "-rag_query", prompt)
-	}
+	m.ophanim.RAGMode = useRAG
+	response := m.ophanim.PromptChatbot(fullPrompt, false)
 
-	response, err := exec.Command(cmd[0], cmd[1:]...).Output()
-	if err != nil {
-		m.logger.Printf("Error executing Ophanim command: %v", err)
-		m.sendResponseToPane(sessionName, fmt.Sprintf("Error executing Ophanim command: %v", err))
-	} else {
-		filteredResponse := m.filterCommandResponse(string(response))
-		m.sendResponseToPane(sessionName, "\x03") // Send Ctrl+C
-		m.sendResponseToPane(sessionName, filteredResponse)
-	}
+	filteredResponse := m.filterCommandResponse(response)
+
+	m.sendResponseToPane(sessionName, "\x03") // Send Ctrl+C
+	m.sendResponseToPane(sessionName, filteredResponse)
 
 	m.clearProcessingMessage(sessionName)
 }
@@ -276,24 +290,174 @@ func (m *Muxnet) sendResponseToPane(sessionName, response string) {
 	exec.Command("tmux", "send-keys", "-t", sessionName, response, "Enter").Run()
 }
 
-func (m *Muxnet) deleteSessionFile(sessionName string) {
-	filePath := fmt.Sprintf("%s/.config/ophanim/muxnet_%s.soul", os.Getenv("HOME"), sessionName)
-	err := os.Remove(filePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			m.sendResponseToPane(sessionName, fmt.Sprintf("Session file %s does not exist.", filePath))
-		} else {
-			m.sendResponseToPane(sessionName, fmt.Sprintf("Error deleting session file: %v", err))
-		}
-	} else {
-		m.sendResponseToPane(sessionName, fmt.Sprintf("Session file %s deleted successfully.", filePath))
-	}
-}
-
 func (m *Muxnet) cleanup() {
 	for sessionName := range m.watchedSessions {
 		m.setSessionLabel(sessionName, "")
 	}
+}
+
+func (o *OphanimClient) initWSClient() {
+	server := LookupEnvOrString("OPHANIM_HOST", "ophanim.azai.run")
+	port := LookupEnvOrString("OPHANIM_PORT", "443")
+	proto := LookupEnvOrString("OPHANIM_PROTO", "wss")
+
+	var err error
+	o.ModelConnection, _, err = websocket.DefaultDialer.Dial(fmt.Sprintf("%s://%s:%s/queue/join", proto, server, port), nil)
+	if err != nil {
+		log.Fatal("Failed to connect to WebSocket server:", err)
+	}
+
+	_, message, err := o.ModelConnection.ReadMessage()
+	if err != nil {
+		return
+	}
+	if !strings.Contains(string(message), `"msg":"send_hash"`) {
+		log.Fatal("Unexpected message from server:", string(message))
+	}
+
+	initialMsg := []byte(fmt.Sprintf(`{"fn_index": 4,"session_hash":"%s"}`, o.SessionHash))
+	if err := o.ModelConnection.WriteMessage(websocket.TextMessage, initialMsg); err != nil {
+		log.Fatal("Failed to send initial message:", err)
+	}
+}
+
+func (o *OphanimClient) PromptChatbot(userInput string, hasChatbotSession bool) (modelResponse string) {
+	o.initWSClient()
+	defer o.ModelConnection.Close()
+
+	for {
+		_, message, err := o.ModelConnection.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway) {
+				return modelResponse
+			} else {
+				log.Fatal("Failed to read message from server:", err)
+				return modelResponse
+			}
+		}
+
+		if strings.Contains(string(message), `"msg":"send_data"`) {
+			nextMessage := o.constructClientMessage(userInput, hasChatbotSession)
+			if nextMessage != "" {
+				if err := o.ModelConnection.WriteMessage(websocket.TextMessage, []byte(nextMessage)); err != nil {
+					log.Fatal("Failed to send message to server:", err)
+				}
+			}
+		}
+
+		if strings.Contains(string(message), `"msg":"process_starts"`) {
+			continue
+		}
+
+		if strings.Contains(string(message), `"msg":"process_generating"`) {
+			continue
+		}
+
+		if strings.Contains(string(message), `"msg":"process_completed"`) {
+			parsedMessage, err := gabs.ParseJSON([]byte(message))
+			if err != nil {
+				log.Fatal("Failed to parse message from server:", err)
+			}
+			if parsedMessage.ExistsP("output.data") {
+				lastEntry := len(parsedMessage.Path("output.data.0").Children()) - 1
+				o.SessionHistory.ArrayAppendP(parsedMessage.Path(fmt.Sprintf("output.data.0.%d", lastEntry)).Children(), "output.data")
+				modelResponse = parsedMessage.Path(fmt.Sprintf("output.data.0.%d", lastEntry)).Children()[1].Data().(string)
+			} else {
+				modelResponse = "No response from server"
+				log.Println("No response from server")
+			}
+			return modelResponse
+		}
+	}
+}
+func (o *OphanimClient) constructClientMessage(userInput string, isContinuation bool) string {
+	userInput = strings.ReplaceAll(userInput, "\n", "")
+	userInput = strings.ReplaceAll(userInput, "\r", "")
+	userInput = strings.ReplaceAll(userInput, "\x00", "")
+	userInput = strings.ReplaceAll(userInput, "\x1a", "")
+	userInput = strings.ReplaceAll(userInput, "'", "")
+	userInput = strings.ReplaceAll(userInput, `"`, "")
+
+	var RAG string
+	if o.RAGMode {
+		RAG = "true"
+	} else {
+		RAG = "false"
+	}
+
+	if !isContinuation {
+		return fmt.Sprintf(`{"data":["","%s","%s",null,[["%s",""]],%s],"event_data":null,"fn_index":6,"session_hash":"%s"}`, o.RAGQuery, o.RAGSource, strings.TrimSpace(userInput), RAG, o.SessionHash)
+	} else {
+		if o.SessionHistory.ExistsP("output.data") {
+			lastMessage := o.SessionHistory.Path("output.data").String()
+			lastMessage = lastMessage[1 : len(lastMessage)-1]
+			return fmt.Sprintf(`{"data":["","%s","%s",null,[%s,["%s",""]],%s],"event_data":null,"fn_index":6,"session_hash":"%s"}`, o.RAGQuery, o.RAGSource, lastMessage, strings.TrimSpace(userInput), RAG, o.SessionHash)
+		}
+		return ""
+	}
+}
+
+func (o *OphanimClient) SaveChatHistory(fileName string) {
+	chatHistoryFile := fmt.Sprintf("%s/%s.soul", o.SaveDir, fileName)
+	if err := os.WriteFile(chatHistoryFile, []byte(o.SessionHistory.String()), 0644); err != nil {
+		log.Printf("Failed to save chat history to file: %v", err)
+		return
+	}
+}
+
+func (o *OphanimClient) LoadChatHistory(fileName string) {
+	chatHistoryFile := fmt.Sprintf("%s/%s.soul", o.SaveDir, fileName)
+	chatHistory, err := os.ReadFile(chatHistoryFile)
+	if err != nil {
+		log.Printf("Failed to load chat history from file: %v", err)
+		return
+	}
+	tempHistory, _ := gabs.ParseJSON(chatHistory)
+	o.SessionHistory = tempHistory
+}
+
+func (o *OphanimClient) UndoLastInteraction() {
+	if o.SessionHistory.ExistsP("output.data") {
+		numberOfExchanges := len(o.SessionHistory.Path("output.data").Children())
+		if numberOfExchanges > 1 {
+			lastEntry := numberOfExchanges - 1
+			o.SessionHistory.DeleteP(fmt.Sprintf("output.data.%d", lastEntry))
+		}
+	}
+}
+
+func (o *OphanimClient) ListChatHistory() {
+	files, err := os.ReadDir(o.SaveDir)
+	if err != nil {
+		log.Printf("Failed to list chat history files: %v", err)
+		return
+	}
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), ".soul") {
+			fmt.Println(strings.TrimSuffix(file.Name(), ".soul"))
+		}
+	}
+}
+
+func (o *OphanimClient) DeleteSessionFile(sessionName string) {
+	filePath := fmt.Sprintf("%s/%s.soul", o.SaveDir, sessionName)
+	err := os.Remove(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("Session file %s does not exist.", filePath)
+		} else {
+			log.Printf("Error deleting session file: %v", err)
+		}
+	} else {
+		log.Printf("Session file %s deleted successfully.", filePath)
+	}
+}
+
+func LookupEnvOrString(key string, defaultVal string) string {
+	if val, ok := os.LookupEnv(key); ok {
+		return val
+	}
+	return defaultVal
 }
 
 func generateSessionName() string {
