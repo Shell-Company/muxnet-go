@@ -145,7 +145,7 @@ func (m *Muxnet) listTmuxSessions() ([]string, error) {
 }
 
 func (m *Muxnet) monitorSession(sessionName string, newStatus map[string]string) {
-	m.setSessionLabel(sessionName, "👁️ "+sessionName)
+	m.setSessionLabel(sessionName, "👁️ ")
 	m.watchedSessions[sessionName] = true
 
 	content, err := m.capturePane(sessionName)
