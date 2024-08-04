@@ -86,8 +86,16 @@ Muxnet uses the following environment variables for configuration:
 
 ## How It Works
 
-1. Muxnet continuously scans active tmux sessions.
+1. Muxnet continuously scans for active tmux sessions.
 2. When it detects a line starting with a recognized glyph, it processes the prompt.
-3. For `#%` prompts, it includes the filtered screen content as context.
+3. Prompt is enriched to increase the likelihood of a successful commandline completion.
 4. The prompt is sent to the Ophanim AI server for processing.
 5. Muxnet filters the response and sends it back to the tmux session.
+
+## Additional Notes
+
+To use Muxnet, you need access to an Ophanim AI server. A default server is provided, but you can also set up your own server by following the instructions in [REDACTED]. General inference requests are served by `MosaicML/mpt-7b-8k` while RAG requests are served by `HuggingFaceH4/zephyr-7b-beta`. These models have been found maliable to adversarial attacks, which conciquently can be used to adapt them to our needs.
+
+## Disclaimer 
+
+Muxnet is a proof-of-concept tool (provided as-is) and should be used for educational purposes only. The developers are not responsible for any misuse of this tool, damage caused by it, or any legal consequences that may arise from its use. Postive results are not guaranteed, and the quality of responses may vary.
