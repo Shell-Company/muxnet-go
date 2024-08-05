@@ -2,6 +2,8 @@
 
 Muxnet is a powerful tool that integrates tmux session monitoring with Ophanim AI capabilities. It allows users to interact with an AI assistant directly within their tmux sessions, providing a seamless blend of terminal multiplexing and artificial intelligence.
 
+![Muxnet Demo](./demo.gif)
+
 ## Features
 
 - Monitor active tmux sessions
